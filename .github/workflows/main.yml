@@ -1,0 +1,304 @@
+name: Titan Cloud PC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # 1 - PREPARAR WINDOWS
+      # ==========================================
+      - name: Preparar Windows
+        shell: powershell
+        run: |
+          Write-Host "Preparando Windows..."
+
+          # Ativar RDP
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Autenticação de nível de rede
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          # Serviço RDP
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Start-Service `
+            -Name "TermService" `
+            -ErrorAction SilentlyContinue
+
+          # Firewall
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP configurado."
+
+      # ==========================================
+      # 2 - CRIAR USUÁRIO
+      # ==========================================
+      - name: Criar usuário RDP
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $Username = "WinRemote"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "ERRO: crie o Secret RDP_PASSWORD."
+          }
+
+          Write-Host "Configurando usuário..."
+
+          $SecurePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          # Procurar usuário
+          $User = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $User) {
+
+              Write-Host "Criando WinRemote..."
+
+              New-LocalUser `
+                -Name $Username `
+                -Password $SecurePassword `
+                -Description "Titan Cloud PC" `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -UserMayNotChangePassword
+
+          }
+          else {
+
+              Write-Host "WinRemote já existe."
+
+              Set-LocalUser `
+                -Name $Username `
+                -Password $SecurePassword
+          }
+
+          Enable-LocalUser `
+            -Name $Username
+
+          # Grupo de usuários de RDP
+          $RdpGroup = Get-LocalGroup `
+            -SID "S-1-5-32-555"
+
+          # Verificar se já está no grupo
+          $Member = Get-LocalGroupMember `
+            -Group $RdpGroup `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match "\\$Username$"
+            }
+
+          if ($null -eq $Member) {
+
+              Write-Host "Adicionando ao grupo Remote Desktop Users..."
+
+              Add-LocalGroupMember `
+                -Group $RdpGroup `
+                -Member $Username `
+                -ErrorAction Stop
+          }
+
+          Write-Host "Usuário configurado corretamente."
+
+      # ==========================================
+      # 3 - OTIMIZAÇÃO
+      # ==========================================
+      - name: Otimizar desempenho
+        shell: powershell
+        run: |
+          Write-Host "Aplicando otimizações..."
+
+          # Alto desempenho
+          powercfg /setactive SCHEME_MIN
+
+          # Desativar transparência
+          Set-ItemProperty `
+            -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" `
+            -Name "EnableTransparency" `
+            -Type DWord `
+            -Value 0 `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          # Reduzir efeitos visuais
+          Set-ItemProperty `
+            -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+            -Name "VisualFXSetting" `
+            -Type DWord `
+            -Value 2 `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Otimização concluída."
+
+      # ==========================================
+      # 4 - INSTALAR TAILSCALE
+      # ==========================================
+      - name: Instalar Tailscale
+        shell: powershell
+        run: |
+          $Installer = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Baixando Tailscale..."
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $Installer `
+            -UseBasicParsing
+
+          Write-Host "Instalando..."
+
+          $Process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$Installer`" /qn /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($Process.ExitCode -ne 0) {
+              throw "Falha na instalação do Tailscale. Código: $($Process.ExitCode)"
+          }
+
+          Remove-Item `
+            $Installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale instalado."
+
+      # ==========================================
+      # 5 - CONECTAR TAILSCALE
+      # ==========================================
+      - name: Conectar Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              throw "ERRO: crie o Secret TAILSCALE_AUTH_KEY."
+          }
+
+          $TS = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $TS)) {
+              throw "Tailscale.exe não encontrado."
+          }
+
+          Write-Host "Conectando ao Tailscale..."
+
+          & $TS up `
+            --auth-key="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="titan-cloud-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Falha ao conectar ao Tailscale."
+          }
+
+          Start-Sleep -Seconds 10
+
+          $IP = (& $TS ip -4 | Select-Object -First 1).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($IP)) {
+              throw "Não foi possível obter o IP Tailscale."
+          }
+
+          "RDP_ADDRESS=$IP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "        TITAN CLOUD PC"
+          Write-Host "=========================================="
+          Write-Host "IP Tailscale: $IP"
+          Write-Host "=========================================="
+
+      # ==========================================
+      # 6 - TESTAR RDP
+      # ==========================================
+      - name: Testar conexão RDP
+        shell: powershell
+        run: |
+          Write-Host "Aguardando serviço RDP..."
+
+          $Success = $false
+
+          for ($i = 1; $i -le 12; $i++) {
+
+              $Result = Test-NetConnection `
+                -ComputerName "127.0.0.1" `
+                -Port 3389 `
+                -WarningAction SilentlyContinue
+
+              if ($Result.TcpTestSucceeded) {
+                  $Success = $true
+                  break
+              }
+
+              Write-Host "Tentativa $i/12..."
+              Start-Sleep -Seconds 5
+          }
+
+          if (!$Success) {
+              throw "O serviço RDP não está respondendo."
+          }
+
+          Write-Host "RDP funcionando."
+
+      # ==========================================
+      # 7 - MOSTRAR INFORMAÇÕES
+      # ==========================================
+      - name: Mostrar informações
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "          TITAN CLOUD PC"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "ENDEREÇO:"
+          Write-Host "$env:RDP_ADDRESS"
+          Write-Host ""
+          Write-Host "PORTA:"
+          Write-Host "3389"
+          Write-Host ""
+          Write-Host "USUÁRIO:"
+          Write-Host ".\WinRemote"
+          Write-Host ""
+          Write-Host "SENHA:"
+          Write-Host "A senha definida em RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "=========================================="
+
+      # ==========================================
+      # 8 - MANTER EXECUÇÃO
+      # ==========================================
+      - name: Manter Cloud PC ativo
+        shell: powershell
+        run: |
+          Write-Host "Titan Cloud PC iniciado."
+
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Cloud PC ativo."
+              Start-Sleep -Seconds 300
+          }
